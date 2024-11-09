@@ -16,6 +16,7 @@ static NSString *const HKPluginKeyEndDate = @"endDate";
 static NSString *const HKPluginKeySampleType = @"sampleType";
 static NSString *const HKPluginKeyAggregation = @"aggregation";
 static NSString *const HKPluginKeyUnit = @"unit";
+static NSString *const HKPluginKeyUnits = @"units";
 static NSString *const HKPluginKeyAmount = @"amount";
 static NSString *const HKPluginKeyValue = @"value";
 static NSString *const HKPluginKeyCorrelationType = @"correlationType";
@@ -228,7 +229,7 @@ static NSString *const HKPluginKeyUUID = @"UUID";
     if ([elem isEqualToString:@"workoutType"]) {
         return [HKObjectType workoutType];
     }
-    
+
     if (@available(iOS 11.0, *)) {
         type = [HKObjectType seriesTypeForIdentifier:elem];
         if (type != nil) {
@@ -605,11 +606,10 @@ static NSString *const HKPluginKeyUUID = @"UUID";
     NSNumber *energy = args[@"energy"];
     NSString *energyUnit = args[@"energyUnit"];
     HKQuantity *nrOfEnergyUnits = nil;
-    if (energy != nil && energy != (id) [NSNull null]) { // better safe than sorry
-        HKUnit *preferredEnergyUnit = [HealthKit getUnit:energyUnit expected:@"HKEnergyUnit"];
+    if (energy != nil && energy != (id) [NSNull null]) {
+        HKUnit *preferredEnergyUnit = [HKUnit unitFromString:energyUnit];
         if (preferredEnergyUnit == nil) {
-            [HealthKit triggerErrorCallbackWithMessage:@"invalid energyUnit was passed" command:command delegate:self.commandDelegate];
-            return;
+            preferredEnergyUnit = [HKUnit kilocalorieUnit]; // Fallback to kcal
         }
         nrOfEnergyUnits = [HKQuantity quantityWithUnit:preferredEnergyUnit doubleValue:energy.doubleValue];
     }
@@ -666,16 +666,20 @@ static NSString *const HKPluginKeyUUID = @"UUID";
                 if (success_save) {
                     // now store the samples, so it shows up in the health app as well (pass this in as an option?)
                     if (energy != nil) {
-                        HKQuantitySample *sampleActivity = [HKQuantitySample quantitySampleWithType:[HKQuantityType quantityTypeForIdentifier:
-                                        quantityType]
-                                                                                           quantity:nrOfDistanceUnits
-                                                                                          startDate:startDate
-                                                                                            endDate:endDate];
-                        HKQuantitySample *sampleCalories = [HKQuantitySample quantitySampleWithType:[HKQuantityType quantityTypeForIdentifier:
-                                        HKQuantityTypeIdentifierActiveEnergyBurned]
-                                                                                           quantity:nrOfEnergyUnits
-                                                                                          startDate:startDate
-                                                                                            endDate:endDate];
+                        // Explicitly create the energy unit
+                        HKUnit *preferredEnergyUnit = [HKUnit kilocalorieUnit];
+                        HKQuantity *energyQuantity = [HKQuantity quantityWithUnit:preferredEnergyUnit doubleValue:energy.doubleValue];
+
+                        HKQuantitySample *sampleActivity = [HKQuantitySample quantitySampleWithType:[HKQuantityType quantityTypeForIdentifier:quantityType]
+                                                                                         quantity:energyQuantity  // Utilisez energyQuantity au lieu de nrOfDistanceUnits
+                                                                                        startDate:startDate
+                                                                                          endDate:endDate];
+
+                        HKQuantitySample *sampleCalories = [HKQuantitySample quantitySampleWithType:[HKQuantityType quantityTypeForIdentifier:HKQuantityTypeIdentifierActiveEnergyBurned]
+                                                                                         quantity:energyQuantity  // Utilisez energyQuantity au lieu de nrOfEnergyUnits
+                                                                                        startDate:startDate
+                                                                                          endDate:endDate];
+
                         NSArray *samples = @[sampleActivity, sampleCalories];
 
                         [[HealthKit sharedHealthStore] addSamples:samples toWorkout:workout completion:^(BOOL success_addSamples, NSError *mostInnerError) {
@@ -1531,14 +1535,19 @@ static NSString *const HKPluginKeyUUID = @"UUID";
     NSDate *startDate = [NSDate dateWithTimeIntervalSince1970:[args[HKPluginKeyStartDate] longValue]];
     NSDate *endDate = [NSDate dateWithTimeIntervalSince1970:[args[HKPluginKeyEndDate] longValue]];
     NSString *correlationTypeString = args[HKPluginKeyCorrelationType];
-    NSString *unitString = args[HKPluginKeyUnit];
+    NSArray<NSString *> *unitsString = args[HKPluginKeyUnits];
 
     HKCorrelationType *type = (HKCorrelationType *) [HealthKit getHKSampleType:correlationTypeString];
     if (type == nil) {
         [HealthKit triggerErrorCallbackWithMessage:@"sampleType was invalid" command:command delegate:self.commandDelegate];
         return;
     }
-    HKUnit *unit = ((unitString != nil) ? [HKUnit unitFromString:unitString] : nil);
+    NSMutableArray *units = [[NSMutableArray alloc] init];
+    for (NSString *unitString in unitsString) {
+        HKUnit *unit = ((unitString != nil) ? [HKUnit unitFromString:unitString] : nil);
+        [units addObject:unit];
+    }
+
     // TODO check that unit is compatible with sampleType if sample type of HKQuantityType
     NSPredicate *predicate = [HKQuery predicateForSamplesWithStartDate:startDate endDate:endDate options:HKQueryOptionStrictStartDate];
 
@@ -1560,6 +1569,8 @@ static NSString *const HKPluginKeyUUID = @"UUID";
 
                 // common indices
                 entry[HKPluginKeyUUID] = sample.UUID.UUIDString;
+                entry[HKPluginKeySourceName] = sample.source.name;
+                entry[HKPluginKeySourceBundleId] = sample.source.bundleIdentifier;
                 if (sample.metadata == nil || ![NSJSONSerialization isValidJSONObject:sample.metadata]) {
                     entry[HKPluginKeyMetadata] = @{};
                 } else {
@@ -1581,18 +1592,22 @@ static NSString *const HKPluginKeyUUID = @"UUID";
 
                     NSMutableArray *samples = [NSMutableArray arrayWithCapacity:correlation.objects.count];
                     for (HKQuantitySample *quantitySample in correlation.objects) {
-                        // if an incompatible unit was passed, the sample is not included
-                        if ([quantitySample.quantity isCompatibleWithUnit:unit]) {
-                            [samples addObject:@{
-                                    HKPluginKeyStartDate: [HealthKit stringFromDate:quantitySample.startDate],
-                                    HKPluginKeyEndDate: [HealthKit stringFromDate:quantitySample.endDate],
-                                    HKPluginKeySampleType: quantitySample.sampleType.identifier,
-                                    HKPluginKeyValue: @([quantitySample.quantity doubleValueForUnit:unit]),
-                                    HKPluginKeyUnit: unit.unitString,
-                                    HKPluginKeyMetadata: (quantitySample.metadata == nil || ![NSJSONSerialization isValidJSONObject:quantitySample.metadata]) ? @{} : quantitySample.metadata,
-                                    HKPluginKeyUUID: quantitySample.UUID.UUIDString
+                        for (int i=0; i<[units count]; i++) {
+                            HKUnit *unit = units[i];
+                            NSString *unitS = unitsString[i];
+                            if ([quantitySample.quantity isCompatibleWithUnit:unit]) {
+                                [samples addObject:@{
+                                                     HKPluginKeyStartDate: [HealthKit stringFromDate:quantitySample.startDate],
+                                                     HKPluginKeyEndDate: [HealthKit stringFromDate:quantitySample.endDate],
+                                                     HKPluginKeySampleType: quantitySample.sampleType.identifier,
+                                                     HKPluginKeyValue: @([quantitySample.quantity doubleValueForUnit:unit]),
+                                                     HKPluginKeyUnit: unitS,
+                                                     HKPluginKeyMetadata: ((quantitySample.metadata != nil) ? quantitySample.metadata : @{}),
+                                                     HKPluginKeyUUID: quantitySample.UUID.UUIDString
+                                                     }
+                                 ];
+                                break;
                             }
-                            ];
                         }
                     }
                     entry[HKPluginKeyObjects] = samples;
@@ -1600,7 +1615,14 @@ static NSString *const HKPluginKeyUUID = @"UUID";
                 } else if ([sample isKindOfClass:[HKQuantitySample class]]) {
 
                     HKQuantitySample *qsample = (HKQuantitySample *) sample;
-                    entry[@"quantity"] = @([qsample.quantity doubleValueForUnit:unit]);
+                    for (int i=0; i<[units count]; i++) {
+                        HKUnit *unit = units[i];
+                        if ([qsample.quantity isCompatibleWithUnit:unit]) {
+                            double quantity = [qsample.quantity doubleValueForUnit:unit];
+                            entry[@"quantity"] = [NSString stringWithFormat:@"%f", quantity];
+                            break;
+                        }
+                    }
 
                 } else if ([sample isKindOfClass:[HKWorkout class]]) {
 
